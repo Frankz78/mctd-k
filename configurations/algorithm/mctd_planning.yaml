@@ -1,0 +1,77 @@
+defaults:
+  - df_base
+
+# Dataset info - required parameters from df_planning
+data_mean: null
+data_std: null
+reward_mean: ${dataset.reward_mean}
+reward_std: ${dataset.reward_std}
+observation_mean: ${dataset.observation_mean}
+observation_std: ${dataset.observation_std}
+action_mean: ${dataset.action_mean}
+action_std: ${dataset.action_std}
+gamma: ${dataset.gamma}
+episode_len: ${dataset.episode_len}
+env_id: ${dataset.env_id}
+x_shape: null
+use_reward: False
+plot_start_goal: True
+padding_mode: same
+
+# MCTD Hyperparameters based on Table 6
+# Training parameters
+learning_rate: 5e-4
+weight_decay: 1e-4
+warmup_steps: 10000
+batch_size: 1024
+max_training_steps: 200005
+
+# Precision settings
+precision_training: 16-mixed
+precision_inference: 32
+
+# Frame and planning parameters
+frame_stack: 10  # The Number of Frame Stack
+context_frames: 1  # Context frames parameter required by df_base
+planning_horizon: null  # Different for each task, set in task configs
+open_loop_horizon: null  # Same to planning horizon for MCTD, 50 for MCTD-Replanning
+
+# Diffusion parameters
+causal: False  # Causal Mask: Not Used
+scheduling_matrix: pyramid  # Scheduling Matrix: pyramid
+guidance_scale: 1.0  # Will be set differently for each task
+chunk_size: ${dataset.episode_len}
+
+# MCTS parameters
+mcts_simulations: 500  # The Maximum Number of Search
+mcts_jumpy_interval: 10  # The Jumpy Denoising Interval
+mcts_depth: 20
+mcts_c_puct: 1.414
+mcts_num_actions: 4
+mcts_subplan_size: 10
+
+# Diffusion model parameters
+diffusion:
+  # Training parameters
+  objective: pred_x0  # Diffusion Model Objective: x0-prediction
+  beta_schedule: linear  # Beta Schedule: Linear
+  schedule_fn_kwargs: {}
+  clip_noise: 20.0
+  use_snr: False
+  use_cum_snr: False
+  use_fused_snr: False
+  snr_clip: 5.0
+  cum_snr_decay: 0.98
+  timesteps: 1000
+  
+  # Sampling parameters
+  sampling_timesteps: 20  # The number of Partial Denoising
+  ddim_sampling_eta: 0.0  # DDIM Sampling eta
+  stabilization_level: 10  # Stabilization Level
+  
+  # Architecture parameters
+  architecture:
+    network_size: 128  # Network Size
+    num_layers: 12  # The Number of Layers
+    attn_heads: 4  # The Number of Attention Heads (matching df_planning)
+    dim_feedforward: 512  # The Feedforward Network Dimension (matching df_planning) 

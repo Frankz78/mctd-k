@@ -5,10 +5,8 @@ services:
     container_name: mctd-k-container
     working_dir: /workspace/mctd-k
     volumes:
-      - ${HOME}/Workspace/mctd-k/outputs:/workspace/mctd-k/outputs
+      - ${HOME}/Workspace/mctd-k:/workspace/mctd-k
       - /home/frank/.wandb:/root/.wandb
-      - ${HOME}/Workspace/mctd-k/configurations:/workspace/mctd-k/configurations
-      - ${HOME}/Workspace/mctd-k/algorithms:/workspace/mctd-k/algorithms
     stdin_open: true
     tty: true
     shm_size: 8g

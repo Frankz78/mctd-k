@@ -144,6 +144,7 @@ cython_debug/
 outputs/
 .hydra
 
+
 /slurm_logs/
 
 checkpoints
@@ -151,3 +152,5 @@ checkpoints
 # Pycharm setting
 .idea/
 data/*
+
+.ckpt

@@ -153,4 +153,4 @@ checkpoints
 .idea/
 data/*
 
-.ckpt
+*.ckpt

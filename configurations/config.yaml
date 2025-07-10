@@ -1,5 +1,6 @@
 # configuration parsing starts here
 defaults:
+  - _self_
   - experiment: exp_video # experiment yaml file name in configurations/experiments folder [fixme]
   - dataset: video_minecraft # dataset yaml file name in configurations/dataset folder [fixme]
   - algorithm: df_video # algorithm yaml file name in configurations/algorithm folder [fixme]

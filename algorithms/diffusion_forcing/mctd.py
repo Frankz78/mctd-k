@@ -19,7 +19,8 @@ from utils.logging_utils import (
 class MCTSNode:
     """MCTS node for tree search"""
     def __init__(self, state: torch.Tensor, parent: Optional['MCTSNode'] = None, action: Optional[float] = None):
-        self.state = state  # current plan state
+        # Store state - MCTS nodes don't need gradients
+        self.state = state.detach().clone()
         self.parent = parent
         self.action = action  # guidance scale that led to this node
         self.children: List['MCTSNode'] = []
@@ -31,7 +32,7 @@ class MCTSNode:
         return len(self.children) == 0
     
     def add_child(self, state: torch.Tensor, action: float) -> 'MCTSNode':
-        child = MCTSNode(state, parent=self, action=action)
+        child = MCTSNode(state.detach().clone(), parent=self, action=action)
         self.children.append(child)
         return child
 
@@ -56,12 +57,15 @@ class MCTDPlanning(DiffusionForcingBase):
         self.open_loop_horizon = cfg.open_loop_horizon
         self.padding_mode = cfg.padding_mode
         
-        # MCTS parameters (simplified based on Table 6)
-        self.n_subplan = getattr(cfg, 'n_subplan', 5)  # Number of subplans for MCTS
-        self.guidance_scales = getattr(cfg, 'guidance_scales', [0, 0.1, 0.5, 1, 2])  # List of guidance scales to use
+        # MCTS parameters from configuration file
+        self.mcts_simulations = getattr(cfg, 'mcts_simulations', 500)  # Total budget of MCTS steps across entire sequence space
+        self.mcts_depth = getattr(cfg, 'mcts_depth', 20)  # Maximum search depth (unified parameter name, replaces original n_subplan)
+        self.mcts_c_puct = getattr(cfg, 'mcts_c_puct', 1.414)  # UCB exploration constant
+        self.mcts_jumpy_interval = getattr(cfg, 'mcts_jumpy_interval', 10)  # Jumpy denoising interval
+        # Note: mcts_subplan_size will be dynamically calculated as total_diffusion_steps / mcts_depth in plan() method
         
-        # MCTS algorithm constants - centralized configuration
-        self.ucb_c_puct = getattr(cfg, 'ucb_c_puct', 1.41)  # UCB exploration constant
+        # Guidance scale options (each MCTS edge represents a subplan selection)
+        self.guidance_scales = getattr(cfg, 'guidance_scales', [0, 0.1, 0.5, 1, 2])  # List of guidance scales to use
         
         super().__init__(cfg)
         self.plot_end_points = cfg.plot_start_goal and self.guidance_scale != 0
@@ -188,6 +192,36 @@ class MCTDPlanning(DiffusionForcingBase):
         MCTS-based diffusion planning following Algorithm 1 from MCTD paper
         Returns plan history of (m, t, b, c), where the last dim of m is the fully diffused plan
         """
+        # Print caller information
+        import inspect
+        try:
+            current_frame = inspect.currentframe()
+            if current_frame is not None:
+                caller_frame = current_frame.f_back
+                if caller_frame is not None:
+                    caller_name = caller_frame.f_code.co_name
+                    caller_line = caller_frame.f_lineno
+                    
+                    # Get more context about the caller
+                    if caller_name == 'eval_planning':
+                        caller_context = "eval_planning (Planning Evaluation)"
+                    elif caller_name == 'interact':
+                        caller_context = "interact (Environment Interaction)"
+                    elif caller_name in ['validation_step', 'test_step']:
+                        caller_context = f"{caller_name} (Validation/Test Step)"
+                    elif caller_name == 'training_step':
+                        caller_context = f"{caller_name} (Training Step)"
+                    else:
+                        caller_context = f"{caller_name} (Other Call)"
+                    
+                    print(f"🔍 MCTS Plan Called - Caller: {caller_context}, Line: {caller_line}, Batch Size: {start.shape[0]}, Horizon: {horizon}")
+                else:
+                    print(f"🔍 MCTS Plan Called - Caller: Unknown (Cannot get call stack), Batch Size: {start.shape[0]}, Horizon: {horizon}")
+            else:
+                print(f"🔍 MCTS Plan Called - Caller: Unknown (Frame is None), Batch Size: {start.shape[0]}, Horizon: {horizon}")
+        except Exception:
+            print(f"🔍 MCTS Plan Called - Caller: Unknown (Check failed), Batch Size: {start.shape[0]}, Horizon: {horizon}")
+        
         batch_size = start.shape[0]
 
         start = self.make_bundle(start)
@@ -247,51 +281,89 @@ class MCTDPlanning(DiffusionForcingBase):
         init_token = rearrange(self.pad_init(start), "fs b c -> 1 b (fs c)")
         plan = torch.cat([init_token, chunk, pad], 0)
 
-        # MCTS Algorithm 1 implementation
+        # MCTS Algorithm 1 implementation following "MCTD performs a tree search over the 
+        # sequence space with a budget of 500 MCTS steps" (2502.07202v4)
         plan_hist = [plan.detach()[: self.n_tokens - pad_tokens]]
         
-        # Initialize MCTS root with initial plan
-        root = MCTSNode(plan[1 : self.n_tokens - pad_tokens].clone())
+        # Initialize MCTS root with initial plan (detached since MCTS doesn't need gradients)
+        root = MCTSNode(plan[1 : self.n_tokens - pad_tokens].detach())
         
         total_diffusion_steps = scheduling_matrix.shape[0] - 1
-        subplan_size = max(1, total_diffusion_steps // self.n_subplan)
         
-        # Main MCTS loop for each subplan
-        for subplan_idx in range(self.n_subplan):
-            step_start = subplan_idx * subplan_size
-            step_end = min((subplan_idx + 1) * subplan_size, total_diffusion_steps)
-            
-            # Skip if no steps in this subplan
-            if step_start >= total_diffusion_steps:
-                break
-            
-            # Standard MCTS procedure (Algorithm 1 lines 3-25)
-            # 1. Selection: traverse tree to find leaf node
+        # Dynamically calculate subplan size: evenly distribute total diffusion steps across depth levels
+        mcts_subplan_size = max(1, total_diffusion_steps // self.mcts_depth)
+        
+        # MCTS main loop with total budget of mcts_simulations steps across entire sequence space
+        # Budget constraint: Each of the mcts_simulations iterations represents one complete MCTS step
+        # (Selection→Expansion→Simulation→Backpropagation) applied to the entire tree structure
+        # This is NOT per-timestep but rather the total computational budget for planning
+        
+        # Add progress bar to display MCTS execution progress and runtime
+        tqdm_progress = None
+        try:
+            from tqdm import tqdm
+            tqdm_progress = tqdm(range(self.mcts_simulations), 
+                                desc=f"MCTS Tree Search (Budget: {self.mcts_simulations} steps)", 
+                                ncols=120,
+                                bar_format='{desc}: {percentage:3.0f}%|{bar}| {n_fmt}/{total_fmt} [ {elapsed}, {remaining},  {rate_fmt}]')
+            mcts_iterator = tqdm_progress
+        except ImportError:
+            # If tqdm is not available, use plain range
+            mcts_iterator = range(self.mcts_simulations)
+        
+        for simulation_idx in mcts_iterator:
+            # 1. Selection: Select from root node to leaf node
             leaf_node = self._select(root)
             
-            # 2. Expansion: add one child if leaf is not fully expanded
-            expanded_child = None
-            if not leaf_node.is_expanded:
-                # Use the middle step of the subplan for expansion
-                step = (step_start + step_end) // 2
-                expanded_child = self._expand(leaf_node, plan, conditions, scheduling_matrix, step, pad_tokens, batch_size, guidance_fn)
+            # Check depth limit: if maximum depth is reached, skip expansion
+            current_depth = self._get_node_depth(leaf_node)
+            if current_depth >= self.mcts_depth:
+                # Maximum depth reached, directly simulate at leaf node
+                simulation_node = leaf_node
+            else:
+                # 2. Expansion: Add a child node to leaf node (if not fully expanded)
+                expanded_child = None
+                if not leaf_node.is_expanded:
+                    # Calculate diffusion step corresponding to current depth
+                    diffusion_step = min(current_depth * mcts_subplan_size, total_diffusion_steps - 1)
+                    expanded_child = self._expand(leaf_node, plan, conditions, scheduling_matrix, 
+                                                diffusion_step, pad_tokens, batch_size, guidance_fn)
+                
+                # 3. Select simulation node
+                simulation_node = expanded_child if expanded_child is not None else leaf_node
             
-            # 3. Simulation: evaluate the expanded node (or leaf if no expansion)
-            simulation_node = expanded_child if expanded_child is not None else leaf_node
+            # 4. Simulation: Evaluate the value of selected node
+            value = self._simulate(simulation_node, plan, conditions, scheduling_matrix, 
+                                 pad_tokens, batch_size, guidance_fn, mcts_subplan_size, total_diffusion_steps)
             
-            value = self._simulate(simulation_node, plan, conditions, scheduling_matrix, pad_tokens, batch_size, guidance_fn)
-            
-            # 4. Backpropagation: update values up the tree
+            # 5. Backpropagation: Backpropagate value to root node
             self._backpropagate(simulation_node, value)
         
+        # Close progress bar
+        if tqdm_progress is not None:
+            tqdm_progress.close()
+        
         # Algorithm 1 Line 27: return BESTCHILD(root)
-        # Select the best child based on visit counts (most explored)
+        # Apply the complete optimal path found by MCTS for evaluate and interact
         if root.children:
-            best_child = max(root.children, key=lambda c: c.visits)
-            # Apply the chosen action (update plan with best child's state)
-            plan[1 : self.n_tokens - pad_tokens] = best_child.state
+            # Extract the complete optimal path (sequence of nodes from root to leaf)
+            optimal_path = self._extract_optimal_path(root)
+            
+            # Apply the optimal path: complete diffusion process following the best guidance sequence
+            plan = self._apply_optimal_path(plan, optimal_path, conditions, scheduling_matrix, 
+                                          pad_tokens, batch_size, guidance_fn, total_diffusion_steps)
+            
+            # Extract MCTS statistics and best action sequence
+            mcts_stats = self._extract_mcts_statistics(root, horizon)
+            best_action_sequence = self._extract_best_action_sequence(root, plan_hist[-1], horizon)
+            
+            # Generate MCTS tree visualization
+            tree_visualization = self._create_mcts_tree_visualization(root, mcts_stats)
+            
+            # Log to wandb
+            self._log_mcts_results(mcts_stats, best_action_sequence, tree_visualization)
         else:
-            # Fallback: if no children were created, apply regular diffusion steps
+            # Fallback: if no children were created during budget-constrained search, apply regular diffusion steps
             for step in range(total_diffusion_steps):
                 plan = self._apply_diffusion_step(plan, conditions, scheduling_matrix, step, pad_tokens, batch_size, guidance_fn)
         
@@ -341,12 +413,20 @@ class MCTDPlanning(DiffusionForcingBase):
 
     def _create_guidance_function(self, guidance_scale: float, base_guidance_fn):
         """Create guidance function based on scale following Algorithm 7"""
-        if guidance_scale == 0:  # gs = NO: Pure exploration
-            return lambda x: torch.zeros(1, device=x.device)
-        elif base_guidance_fn is None:  # No base guidance available
-            return lambda x: torch.zeros(1, device=x.device)
+        if guidance_scale == 0 or base_guidance_fn is None:  # gs = NO: Pure exploration or no guidance
+            # Return a dummy function that returns zero but maintains gradients
+            def dummy_guidance(x):
+                # Ensure the returned tensor depends on input x to maintain gradient flow
+                return torch.sum(x * 0.0)  # This depends on x but evaluates to 0
+            return dummy_guidance
         else:  # gs ≠ NO: Guided sampling with scaled guidance
-            return lambda x: guidance_scale * base_guidance_fn(x) / max(self.guidance_scale, 1e-8)
+            def scaled_guidance(x):
+                # base_guidance_fn already includes self.guidance_scale, so we need to normalize first
+                base_result = base_guidance_fn(x)
+                # Remove the original scaling and apply the new one
+                normalized_result = base_result / max(self.guidance_scale, 1e-8)
+                return guidance_scale * normalized_result
+            return scaled_guidance
 
     def _calculate_ucb_score(self, action_or_child, node: MCTSNode, total_visits: int) -> float:
         """Calculate UCB1 score for either a child node or a potential action"""
@@ -362,7 +442,7 @@ class MCTDPlanning(DiffusionForcingBase):
                 return exploitation
             
             import math
-            exploration = self.ucb_c_puct * math.sqrt(math.log(total_visits) / child.visits)
+            exploration = self.mcts_c_puct * math.sqrt(math.log(total_visits) / child.visits)
             
             return exploitation + exploration
             
@@ -389,7 +469,7 @@ class MCTDPlanning(DiffusionForcingBase):
             # UCB1 formula: exploitation + exploration
             import math
             exploitation = action_value
-            exploration = self.ucb_c_puct * math.sqrt(math.log(total_visits) / action_visits)
+            exploration = self.mcts_c_puct * math.sqrt(math.log(total_visits) / action_visits)
             
             return exploitation + exploration
 
@@ -437,15 +517,20 @@ class MCTDPlanning(DiffusionForcingBase):
     
     def _fast_jumpy_denoising(self, node: MCTSNode, plan: torch.Tensor, conditions, 
                              scheduling_matrix: np.ndarray, pad_tokens: int, 
-                             batch_size: int, guidance_fn) -> torch.Tensor:
+                             batch_size: int, guidance_fn, mcts_subplan_size: int, 
+                             total_diffusion_steps: int) -> torch.Tensor:
         """FASTJUMPYDENOISING: Complete denoising from node state to final plan following Algorithm 5"""
         # Start with the node's current state
         temp_plan = plan.clone()
         temp_plan[1 : self.n_tokens - pad_tokens] = node.state
         
-        # Apply remaining diffusion steps to complete denoising
-        total_steps = scheduling_matrix.shape[0] - 1
-        for step in range(total_steps):
+        # Calculate the diffusion step corresponding to this node's depth
+        current_depth = self._get_node_depth(node)
+        start_step = min(current_depth * mcts_subplan_size, total_diffusion_steps - 1)
+        
+        # Apply remaining diffusion steps from the node's corresponding step onwards
+        # This maintains MCTS tree semantics where each node represents a partial denoising state
+        for step in range(start_step, total_diffusion_steps):
             temp_plan = self._apply_diffusion_step(temp_plan, conditions, scheduling_matrix, 
                                                  step, pad_tokens, batch_size, guidance_fn)
         
@@ -481,11 +566,13 @@ class MCTDPlanning(DiffusionForcingBase):
             pos_distances = torch.norm(pos_diffs, dim=2)  # Shape: (T-1, B)
             
             # Define maximum physically reasonable distance per step
-            max_step_distance = 0.5  # Adjust based on environment specifics
+            max_step_distance = 0.08  # Adjust based on environment specifics
             
             # Penalty for unrealistic jumps
             large_jumps = pos_distances > max_step_distance
-            position_penalty = -large_jumps.float().sum().item() * 10.0  # Heavy penalty
+            position_penalty = -large_jumps.float().sum().item() * 2.0  # Heavy penalty
+            print(f"Pos distances: {pos_distances}")
+            print(f"Position penalty: {position_penalty}")
         
         # Rule 2: Reward for reaching the goal using first_reach metric borrowed from validation_step
         goal_reward = 0.0
@@ -549,11 +636,12 @@ class MCTDPlanning(DiffusionForcingBase):
 
     def _simulate(self, node: MCTSNode, plan: torch.Tensor, conditions, 
                  scheduling_matrix: np.ndarray, pad_tokens: int, batch_size: int, 
-                 guidance_fn) -> float:
+                 guidance_fn, mcts_subplan_size: int, total_diffusion_steps: int) -> float:
         """Simulation phase following Algorithm 5 from MCTD paper (Jumpy Denoising)"""
         # Step 2: fullPlan ← FASTJUMPYDENOISING(node)
         full_plan = self._fast_jumpy_denoising(node, plan, conditions, scheduling_matrix, 
-                                             pad_tokens, batch_size, guidance_fn)
+                                             pad_tokens, batch_size, guidance_fn, mcts_subplan_size, 
+                                             total_diffusion_steps)
         
         # Step 3: return EVALUATEPLAN(fullPlan)
         return self._evaluate_plan(full_plan, guidance_fn)
@@ -570,6 +658,419 @@ class MCTDPlanning(DiffusionForcingBase):
             
             # Step 6: node ← node.parent
             node = node.parent
+
+    def _extract_mcts_statistics(self, root: MCTSNode, horizon: int) -> Dict[str, Any]:
+        """Extract MCTS tree statistics for analysis"""
+        stats = {
+            'total_nodes': 0,
+            'total_visits': 0,
+            'max_depth': 0,
+            'children_stats': [],
+            'action_distribution': {},
+            'value_distribution': []
+        }
+        
+        def traverse_tree(node: MCTSNode, depth: int = 0):
+            stats['total_nodes'] += 1
+            stats['total_visits'] += node.visits
+            stats['max_depth'] = max(stats['max_depth'], depth)
+            
+            if node.visits > 0:
+                stats['value_distribution'].append(node.value / node.visits)
+            
+            # Record children statistics
+            if node.children:
+                for child in node.children:
+                    child_stat = {
+                        'action': child.action,
+                        'visits': child.visits,
+                        'value': child.value,
+                        'avg_value': child.value / max(child.visits, 1),
+                        'depth': depth + 1
+                    }
+                    stats['children_stats'].append(child_stat)
+                    
+                    # Count action distribution
+                    action_key = f"guidance_{child.action}"
+                    if action_key not in stats['action_distribution']:
+                        stats['action_distribution'][action_key] = 0
+                    stats['action_distribution'][action_key] += child.visits
+                    
+                    # Recursively traverse
+                    traverse_tree(child, depth + 1)
+        
+        traverse_tree(root)
+        
+        # Calculate additional statistics
+        if stats['children_stats']:
+            stats['best_action'] = max(stats['children_stats'], key=lambda x: x['visits'])['action']
+            stats['avg_visits_per_action'] = {}
+            for action, visits in stats['action_distribution'].items():
+                children_with_action = [c for c in stats['children_stats'] if c['action'] == action]
+                if children_with_action:  # Avoid division by zero
+                    stats['avg_visits_per_action'][action] = visits / len(children_with_action)
+                else:
+                    stats['avg_visits_per_action'][action] = 0
+        
+        return stats
+    
+    def _extract_best_action_sequence(self, root: MCTSNode, final_plan: torch.Tensor, horizon: int) -> Dict[str, Any]:
+        """Extract the best action sequence from MCTS tree and final plan"""
+        # Get the optimal path through the MCTS tree (consistent with _extract_optimal_path)
+        optimal_path = self._extract_optimal_path(root)
+        
+        # Convert optimal path to best_path information
+        best_path = []
+        for node in optimal_path[1:]:  # Skip root node
+            best_path.append({
+                'guidance_scale': node.action,
+                'visits': node.visits,
+                'avg_value': node.value / max(node.visits, 1)
+            })
+        
+        # Extract action sequence from final plan
+        # Safely handle tensor shapes, avoid einops errors
+        try:
+            final_plan_unstacked = self._unstack_and_unnormalize(final_plan.unsqueeze(0))[0]
+            final_plan_clipped = final_plan_unstacked[self.frame_stack - 1 : self.frame_stack - 1 + horizon]
+            
+            if final_plan_clipped.shape[0] > 0:
+                observations, actions, rewards = self.split_bundle(final_plan_clipped)
+                
+                action_sequence = {
+                    'actions': actions.detach().cpu().numpy().tolist() if actions is not None else [],
+                    'observations': observations.detach().cpu().numpy()[:, :4].tolist() if observations.shape[-1] >= 4 else observations.detach().cpu().numpy().tolist(),
+                    'plan_length': final_plan_clipped.shape[0],
+                    'mcts_path': best_path,
+                    'mcts_depth': len(best_path)
+                }
+            else:
+                action_sequence = {
+                    'actions': [],
+                    'observations': [],
+                    'plan_length': 0,
+                    'mcts_path': best_path,
+                    'mcts_depth': len(best_path)
+                }
+        except Exception as e:
+            # If tensor processing fails, return basic information
+            action_sequence = {
+                'actions': [],
+                'observations': [],
+                'plan_length': 0,
+                'mcts_path': best_path,
+                'mcts_depth': len(best_path),
+                'extraction_error': str(e)
+            }
+        
+        return action_sequence
+    
+    def _create_mcts_tree_visualization(self, root: MCTSNode, mcts_stats: Dict[str, Any]) -> Optional[Any]:
+        """Create MCTS tree visualization using matplotlib and networkx"""
+        try:
+            import matplotlib.pyplot as plt
+            import matplotlib.patches as mpatches
+            import networkx as nx
+            from matplotlib.patches import FancyBboxPatch
+            import io
+            
+            # Check if there's enough data for visualization
+            if mcts_stats['total_nodes'] <= 1 or not root.children:
+                return None  # Skip visualization if only root node or no children
+            
+            # Create directed graph
+            G = nx.DiGraph()
+            pos = {}
+            node_labels = {}
+            node_colors = []
+            node_sizes = []
+            edge_colors = []
+            
+            # Find best path for highlighting
+            best_path_nodes = set()
+            current_node = root
+            node_id = 0
+            best_path_nodes.add(node_id)
+            
+            while current_node.children:
+                best_child = max(current_node.children, key=lambda c: c.visits)
+                for child in current_node.children:
+                    if child == best_child:
+                        node_id += 1
+                        best_path_nodes.add(node_id)
+                        break
+                current_node = best_child
+            
+            # Build graph structure
+            def add_nodes_recursive(node: MCTSNode, parent_id: Optional[int] = None, depth: int = 0, x_offset: float = 0.0):
+                nonlocal node_id
+                current_id = node_id if parent_id is None else len(G.nodes)
+                
+                # Add node
+                G.add_node(current_id)
+                
+                # Position calculation for tree layout
+                pos[current_id] = (x_offset, -depth)
+                
+                # Node label with visits and value info
+                if node.visits > 0:
+                    avg_value = node.value / node.visits
+                    node_labels[current_id] = f"V:{node.visits}\nR:{avg_value:.2f}"
+                    if hasattr(node, 'action') and node.action is not None:
+                        node_labels[current_id] += f"\nG:{node.action}"
+                else:
+                    node_labels[current_id] = "V:0\nR:0.0"
+                    if hasattr(node, 'action') and node.action is not None:
+                        node_labels[current_id] += f"\nG:{node.action}"
+                
+                # Node color and size based on visits and best path
+                if current_id in best_path_nodes:
+                    node_colors.append('#FFD700')  # Gold for best path
+                elif node.visits > 0:
+                    # Color intensity based on visits (more visits = darker blue)
+                    max_visits = max([n.visits for n in self._get_all_nodes(root)] + [1])
+                    intensity = min(node.visits / max_visits, 1.0)
+                    # Generate blue color with varying intensity
+                    blue_intensity = int(255 * (0.3 + 0.7 * intensity))
+                    node_colors.append(f'#{100:02x}{150:02x}{blue_intensity:02x}')
+                else:
+                    node_colors.append('#E0E0E0')  # Light gray for unvisited
+                
+                # Node size based on visits
+                base_size = 300
+                if node.visits > 0:
+                    max_visits = max([n.visits for n in self._get_all_nodes(root)] + [1])
+                    size_multiplier = 1 + (node.visits / max_visits) * 2
+                    node_sizes.append(base_size * size_multiplier)
+                else:
+                    node_sizes.append(base_size * 0.5)
+                
+                # Add edges to children
+                if node.children:
+                    child_spacing = 2.0 / (len(node.children) + 1)
+                    for i, child in enumerate(node.children):
+                        child_id = len(G.nodes)
+                        child_x = x_offset + (i - len(node.children)/2 + 0.5) * child_spacing
+                        
+                        # Add edge
+                        G.add_edge(current_id, child_id)
+                        
+                        # Edge color (highlight best path)
+                        if current_id in best_path_nodes:
+                            best_child = max(node.children, key=lambda c: c.visits)
+                            if child == best_child:
+                                edge_colors.append('#FFD700')  # Gold for best path
+                            else:
+                                edge_colors.append('#CCCCCC')  # Gray for other edges
+                        else:
+                            edge_colors.append('#CCCCCC')
+                        
+                        # Recursively add child nodes
+                        add_nodes_recursive(child, current_id, depth + 1, child_x)
+                
+                return current_id
+            
+            # Build the tree
+            root_id = add_nodes_recursive(root)
+            
+            # Create visualization
+            plt.figure(figsize=(14, 10))
+            plt.clf()
+            
+            # Draw the graph  
+            # Type ignore for networkx drawing functions that accept color lists
+            nx.draw_networkx_nodes(G, pos, node_color=node_colors, node_size=node_sizes, alpha=0.8)  # type: ignore
+            nx.draw_networkx_edges(G, pos, edge_color=edge_colors, arrows=True, arrowsize=20,   # type: ignore
+                                 arrowstyle='->', alpha=0.6, width=2)
+            nx.draw_networkx_labels(G, pos, node_labels, font_size=8, font_weight='bold')
+            
+            # Add title and legend
+            plt.title("MCTS Tree Structure\n(V=Visits, R=Avg Reward, G=Guidance Scale)", 
+                     fontsize=16, fontweight='bold', pad=20)
+            
+            # Create legend
+            legend_elements = [
+                mpatches.Patch(color='#FFD700', label='Best Path'),
+                mpatches.Patch(color='#4A90E2', label='Visited Nodes'),
+                mpatches.Patch(color='#E0E0E0', label='Unvisited Nodes')
+            ]
+            plt.legend(handles=legend_elements, loc='upper right', bbox_to_anchor=(1.15, 1))
+            
+            # Add statistics text
+            stats_text = f"Total Nodes: {mcts_stats['total_nodes']}\n"
+            stats_text += f"Total Visits: {mcts_stats['total_visits']}\n"
+            stats_text += f"Max Depth: {mcts_stats['max_depth']}\n"
+            if 'best_action' in mcts_stats:
+                stats_text += f"Best Guidance: {mcts_stats['best_action']}"
+            
+            plt.text(0.02, 0.98, stats_text, transform=plt.gca().transAxes, 
+                    fontsize=10, verticalalignment='top',
+                    bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.8))
+            
+            plt.axis('off')
+            plt.tight_layout()
+            
+            # Save to memory buffer
+            buf = io.BytesIO()
+            plt.savefig(buf, format='png', dpi=150, bbox_inches='tight')
+            buf.seek(0)
+            
+            # Convert to PIL Image for wandb
+            from PIL import Image
+            tree_image = Image.open(buf)
+            
+            plt.close()  # Clean up
+            buf.close()
+            
+            return tree_image
+            
+        except Exception as e:
+            # Silently handle visualization errors and return None
+            return None
+    
+    def _get_all_nodes(self, root: MCTSNode) -> List[MCTSNode]:
+        """Helper function to get all nodes in the tree"""
+        nodes = [root]
+        for child in root.children:
+            nodes.extend(self._get_all_nodes(child))
+        return nodes
+    
+    def _get_node_depth(self, node: MCTSNode) -> int:
+        """Calculate the depth of a node (root has depth 0)"""
+        depth = 0
+        current = node
+        while current.parent is not None:
+            depth += 1
+            current = current.parent
+        return depth
+    
+    def _extract_optimal_path(self, root: MCTSNode) -> List[MCTSNode]:
+        """Extract the optimal path from root to leaf node based on visit counts"""
+        optimal_path = [root]
+        current_node = root
+        
+        # Follow the path of highest visit counts until reaching a leaf
+        while current_node.children:
+            # Select child with most visits (most explored = most promising)
+            best_child = max(current_node.children, key=lambda c: c.visits)
+            optimal_path.append(best_child)
+            current_node = best_child
+        
+        return optimal_path
+    
+    def _apply_optimal_path(self, plan: torch.Tensor, optimal_path: List[MCTSNode], 
+                           conditions, scheduling_matrix: np.ndarray, pad_tokens: int, 
+                           batch_size: int, guidance_fn, total_diffusion_steps: int) -> torch.Tensor:
+        """Apply the optimal path by executing diffusion steps with the best guidance sequence"""
+        # Start with initial plan
+        current_plan = plan.clone()
+        
+        # Calculate steps per depth level
+        steps_per_level = max(1, total_diffusion_steps // len(optimal_path)) if len(optimal_path) > 1 else total_diffusion_steps
+        
+        # Apply diffusion following the optimal guidance sequence
+        current_step = 0
+        for i, node in enumerate(optimal_path[1:], 1):  # Skip root node
+            # Determine guidance scale for this level
+            guidance_scale = node.action if hasattr(node, 'action') and node.action is not None else 0.0
+            
+            # Create guidance function for this level
+            level_guidance_fn = self._create_guidance_function(guidance_scale, guidance_fn)
+            
+            # Apply diffusion steps for this level
+            level_steps = min(steps_per_level, total_diffusion_steps - current_step)
+            for step_offset in range(level_steps):
+                if current_step < total_diffusion_steps:
+                    current_plan = self._apply_diffusion_step(current_plan, conditions, scheduling_matrix, 
+                                                            current_step, pad_tokens, batch_size, level_guidance_fn)
+                    current_step += 1
+        
+        # Apply any remaining diffusion steps with the final guidance
+        if current_step < total_diffusion_steps and optimal_path:
+            final_node = optimal_path[-1]
+            final_guidance_scale = final_node.action if hasattr(final_node, 'action') and final_node.action is not None else 0.0
+            final_guidance_fn = self._create_guidance_function(final_guidance_scale, guidance_fn)
+            
+            for remaining_step in range(current_step, total_diffusion_steps):
+                current_plan = self._apply_diffusion_step(current_plan, conditions, scheduling_matrix, 
+                                                        remaining_step, pad_tokens, batch_size, final_guidance_fn)
+        
+        return current_plan
+    
+    def _log_mcts_results(self, mcts_stats: Dict[str, Any], action_sequence: Dict[str, Any], tree_visualization: Optional[Any] = None):
+        """Log MCTS results to wandb - statistics from budget-constrained tree search"""
+        # Log MCTS tree statistics from budget-constrained search
+        self.log("mcts/total_nodes", mcts_stats['total_nodes'])
+        self.log("mcts/total_visits", mcts_stats['total_visits'])  # Should equal mcts_simulations budget
+        self.log("mcts/max_depth", mcts_stats['max_depth'])
+        self.log("mcts/avg_visits_per_node", mcts_stats['total_visits'] / max(mcts_stats['total_nodes'], 1))
+        
+        if 'best_action' in mcts_stats:
+            self.log("mcts/best_guidance_scale", mcts_stats['best_action'])
+        
+        # Log action distribution
+        for action, visits in mcts_stats['action_distribution'].items():
+            self.log(f"mcts/action_dist/{action}", visits)
+        
+        # Log value distribution statistics
+        if mcts_stats['value_distribution']:
+            import numpy as np
+            values = np.array(mcts_stats['value_distribution'])
+            self.log("mcts/avg_node_value", float(np.mean(values)))
+            self.log("mcts/std_node_value", float(np.std(values)))
+            self.log("mcts/min_node_value", float(np.min(values)))
+            self.log("mcts/max_node_value", float(np.max(values)))
+        
+        # Log action sequence information
+        self.log("mcts/plan_length", action_sequence['plan_length'])
+        self.log("mcts/mcts_depth", action_sequence['mcts_depth'])
+        self.log("mcts/optimal_path_length", len(action_sequence['mcts_path']))
+        
+        # Log best path information
+        if action_sequence['mcts_path']:
+            guidance_sequence = [step['guidance_scale'] for step in action_sequence['mcts_path']]
+            # Log guidance sequence statistics
+            import numpy as np
+            self.log("mcts/optimal_guidance_mean", float(np.mean(guidance_sequence)))
+            self.log("mcts/optimal_guidance_std", float(np.std(guidance_sequence)))
+            self.log("mcts/optimal_guidance_max", float(np.max(guidance_sequence)))
+            
+            for i, step in enumerate(action_sequence['mcts_path']):
+                self.log(f"mcts/best_path/step_{i}_guidance", step['guidance_scale'])
+                self.log(f"mcts/best_path/step_{i}_visits", step['visits'])
+                self.log(f"mcts/best_path/step_{i}_value", step['avg_value'])
+        
+        # Log tree visualization if available
+        if tree_visualization is not None:
+            self.log_image("mcts/tree_structure", tree_visualization)
+        
+        # Store detailed results as wandb artifacts if available
+        try:
+            import wandb
+            # Check if we have a valid wandb logger
+            if hasattr(self, 'logger') and self.logger is not None:
+                logger_experiment = getattr(self.logger, 'experiment', None)
+                if logger_experiment is not None and hasattr(logger_experiment, 'log'):
+                    # Create a table for children statistics
+                    if mcts_stats['children_stats']:
+                        children_table = wandb.Table(
+                            columns=['action', 'visits', 'value', 'avg_value', 'depth'],
+                            data=[[c['action'], c['visits'], c['value'], c['avg_value'], c['depth']] 
+                                  for c in mcts_stats['children_stats']]
+                        )
+                        logger_experiment.log({"mcts/children_statistics": children_table})
+                    
+                    # Log action sequence as artifact
+                    if action_sequence['actions']:
+                        action_artifact = wandb.Artifact("best_action_sequence", type="plan")
+                        with action_artifact.new_file("action_sequence.json", mode="w") as f:
+                            import json
+                            json.dump(action_sequence, f, indent=2)
+                        logger_experiment.log_artifact(action_artifact)
+                        
+        except Exception:
+            # Silently handle wandb logging errors
+            pass
 
     def _apply_diffusion_step(self, plan: torch.Tensor, conditions, scheduling_matrix: np.ndarray,
                              step: int, pad_tokens: int, batch_size: int, guidance_fn) -> torch.Tensor:
@@ -589,6 +1090,8 @@ class MCTDPlanning(DiffusionForcingBase):
         to_noise_levels = torch.from_numpy(to_noise_levels).to(self.device)
         from_noise_levels = repeat(from_noise_levels, "t -> t b", b=batch_size)
         to_noise_levels = repeat(to_noise_levels, "t -> t b", b=batch_size)
+        
+        # Note: gradients are handled automatically in diffusion model when guidance_fn is used
         
         plan[1 : self.n_tokens - pad_tokens] = self.diffusion_model.sample_step(
             plan, conditions, from_noise_levels, to_noise_levels, guidance_fn=guidance_fn

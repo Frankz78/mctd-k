@@ -34,7 +34,7 @@ precision_inference: 32
 frame_stack: 10  # The Number of Frame Stack
 context_frames: 1  # Context frames parameter required by df_base
 planning_horizon: null  # Different for each task, set in task configs
-open_loop_horizon: null  # Same to planning horizon for MCTD, 50 for MCTD-Replanning
+open_loop_horizon: ${dataset.episode_len}  # Use small horizon for MCTS replanning (1-step lookahead)
 
 # Diffusion parameters
 causal: False  # Causal Mask: Not Used
@@ -43,12 +43,12 @@ guidance_scale: 1.0  # Will be set differently for each task
 chunk_size: ${dataset.episode_len}
 
 # MCTS parameters
-mcts_simulations: 500  # The Maximum Number of Search
+mcts_simulations: 500  # Total budget of MCTS steps across entire sequence space (reduced from 500 for quick testing)
+mcts_depth: 5  # Maximum search depth (reduced for quick testing)
+mcts_c_puct: 1.414  # UCB exploration constant
 mcts_jumpy_interval: 10  # The Jumpy Denoising Interval
-mcts_depth: 20
-mcts_c_puct: 1.414
 mcts_num_actions: 4
-mcts_subplan_size: 10
+# Note: mcts_subplan_size has been removed, will be dynamically calculated as (total_diffusion_steps) / mcts_depth
 
 # Diffusion model parameters
 diffusion:

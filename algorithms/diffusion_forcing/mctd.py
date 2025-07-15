@@ -72,22 +72,11 @@ class MCTDPlanning(DiffusionForcingBase):
         # Usage examples in config:
         # enable_tqdm: false                    # Disable progress bar
         # enable_debug_output: false            # Disable debug print statements
-        # enable_gpu_parallel: true             # Enable GPU parallel processing
-        # gpu_memory_efficient: true           # Use memory-efficient GPU operations
         self.enable_tqdm = getattr(cfg, 'enable_tqdm', True)  # Enable/disable tqdm progress bar
-        self.enable_debug_output = getattr(cfg, 'enable_debug_output', False)  # Enable/disable debug print statements
-        self.enable_gpu_parallel = getattr(cfg, 'enable_gpu_parallel', True)  # Enable/disable GPU parallel processing
-        self.gpu_memory_efficient = getattr(cfg, 'gpu_memory_efficient', True)  # Enable memory-efficient GPU operations
+        self.enable_debug_output = getattr(cfg, 'enable_debug_output', True)  # Enable/disable debug print statements
         
         # MCTS context flag for proper guidance function handling
         self._in_mcts_context = False
-        
-        # Performance optimization: cache for guidance functions and diffusion results
-        self._guidance_cache = {}
-        self._diffusion_cache = {}
-        
-        # Initialize tqdm test flag for compatibility checking
-        self._tqdm_available = self._check_tqdm_availability()
         
         super().__init__(cfg)
         self.plot_end_points = cfg.plot_start_goal and self.guidance_scale != 0
@@ -271,9 +260,6 @@ class MCTDPlanning(DiffusionForcingBase):
         """
         # Print caller information
         import inspect
-        import time
-        plan_start_time = time.time()
-        
         if self.enable_debug_output:
             try:
                 current_frame = inspect.currentframe()
@@ -295,23 +281,18 @@ class MCTDPlanning(DiffusionForcingBase):
                         else:
                             caller_context = f"{caller_name} (Other Call)"
                         
-                        print(f"🔍 Per-Trajectory MCTS Plan Called - Caller: {caller_context}, Line: {caller_line}, Batch Size: {start.shape[0]}, Horizon: {horizon}")
-                        print(f"  MCTS Config: {self.mcts_simulations} simulations × {start.shape[0]} trajectories = {self.mcts_simulations * start.shape[0]} total operations")
+                        print(f"🔍 MCTS Plan Called - Caller: {caller_context}, Line: {caller_line}, Batch Size: {start.shape[0]}, Horizon: {horizon}")
                     else:
-                        print(f"🔍 Per-Trajectory MCTS Plan Called - Caller: Unknown (Cannot get call stack), Batch Size: {start.shape[0]}, Horizon: {horizon}")
+                        print(f"🔍 MCTS Plan Called - Caller: Unknown (Cannot get call stack), Batch Size: {start.shape[0]}, Horizon: {horizon}")
                 else:
-                    print(f"🔍 Per-Trajectory MCTS Plan Called - Caller: Unknown (Frame is None), Batch Size: {start.shape[0]}, Horizon: {horizon}")
+                    print(f"🔍 MCTS Plan Called - Caller: Unknown (Frame is None), Batch Size: {start.shape[0]}, Horizon: {horizon}")
             except Exception:
-                print(f"🔍 Per-Trajectory MCTS Plan Called - Caller: Unknown (Check failed), Batch Size: {start.shape[0]}, Horizon: {horizon}")
+                print(f"🔍 MCTS Plan Called - Caller: Unknown (Check failed), Batch Size: {start.shape[0]}, Horizon: {horizon}")
         
         batch_size = start.shape[0]
         
         # Set MCTS context flag for proper guidance function creation
         self._in_mcts_context = True
-        
-        # Clear caches for new planning session
-        self._diffusion_cache.clear()
-        self._guidance_cache.clear()
 
         start = self.make_bundle(start)
         goal = self.make_bundle(goal)
@@ -372,25 +353,17 @@ class MCTDPlanning(DiffusionForcingBase):
         
         # Add progress bar to display MCTS execution progress and runtime
         tqdm_progress = None
-        if self.enable_tqdm and self._tqdm_available:
-            from tqdm import tqdm
-            # Update progress bar description based on processing mode
-            total_operations = self.mcts_simulations * batch_size
-            processing_mode = "Parallel GPU" if self.enable_gpu_parallel and batch_size > 1 else "Sequential"
-            memory_mode = "Mem-Efficient" if self.gpu_memory_efficient else "Standard"
-            
-            # Enhanced GPU-aware progress bar
-            gpu_info = ""
-            if self.enable_gpu_parallel and torch.cuda.is_available():
-                gpu_name = torch.cuda.get_device_name(0)
-                gpu_info = f" on {gpu_name[:20]}"
-            
-            tqdm_progress = tqdm(range(self.mcts_simulations), 
-                                desc=f"MCTS {processing_mode} {memory_mode} Search{gpu_info} (Budget: {self.mcts_simulations}×{batch_size}={total_operations})", 
-                                ncols=160,
-                                bar_format='{desc}: {percentage:3.0f}%|{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]',
-                                dynamic_ncols=True)
-            mcts_iterator = tqdm_progress
+        if self.enable_tqdm:
+            try:
+                from tqdm import tqdm
+                tqdm_progress = tqdm(range(self.mcts_simulations), 
+                                    desc=f"MCTS Tree Search (Budget: {self.mcts_simulations} steps)", 
+                                    ncols=120,
+                                    bar_format='{desc}: {percentage:3.0f}%|{bar}| {n_fmt}/{total_fmt} [ {elapsed}, {remaining},  {rate_fmt}]')
+                mcts_iterator = tqdm_progress
+            except ImportError:
+                # If tqdm is not available, use plain range
+                mcts_iterator = range(self.mcts_simulations)
         else:
             # Tqdm disabled, use plain range
             mcts_iterator = range(self.mcts_simulations)
@@ -409,26 +382,26 @@ class MCTDPlanning(DiffusionForcingBase):
                                              pad_tokens, batch_size, guidance_fn, mcts_subplan_size, 
                                              total_diffusion_steps, start, goal)
             else:
-                # Original sequential processing for compatibility
-                self._sequential_mcts_simulation(roots, simulation_idx, plan, conditions, scheduling_matrix, 
-                                               pad_tokens, batch_size, guidance_fn, mcts_subplan_size, 
-                                               total_diffusion_steps, start, goal)
+                # 2. Expansion: Add a child node to leaf node (if not fully expanded)
+                expanded_child = None
+                if not leaf_node.is_expanded:
+                    # Calculate diffusion step corresponding to current depth
+                    diffusion_step = min(current_depth * mcts_subplan_size, total_diffusion_steps - 1)
+                    expanded_child = self._expand(leaf_node, plan, conditions, scheduling_matrix, 
+                                                diffusion_step, pad_tokens, batch_size, guidance_fn, mcts_subplan_size,
+                                                total_diffusion_steps)
+                
+                # 3. Select simulation node
+                simulation_node = expanded_child if expanded_child is not None else leaf_node
             
-            # Check for early stopping every 10 iterations
-            if simulation_idx > 10 and simulation_idx % 10 == 0:
-                current_best_values = [root.value for root in roots]
-                improvement = sum(abs(current - last) for current, last in zip(current_best_values, last_best_values))
-                
-                if improvement < convergence_threshold:
-                    no_improvement_count += 10
-                    if no_improvement_count >= max_no_improvement:
-                        if self.enable_debug_output:
-                            print(f"    🛑 Early stopping at iteration {simulation_idx+1} due to convergence")
-                        break
-                else:
-                    no_improvement_count = 0
-                
-                last_best_values = current_best_values
+            # 4. Simulation: Evaluate the value of selected node
+            # Pass original start and goal to _simulate
+            value = self._simulate(simulation_node, plan, conditions, scheduling_matrix, 
+                                 pad_tokens, batch_size, guidance_fn, mcts_subplan_size, total_diffusion_steps,
+                                 start, goal)
+            
+            # 5. Backpropagation: Backpropagate value to root node
+            self._backpropagate(simulation_node, value)
         
         # Close progress bar
         if tqdm_progress is not None:
@@ -474,56 +447,6 @@ class MCTDPlanning(DiffusionForcingBase):
 
         # Clear MCTS context flag
         self._in_mcts_context = False
-        
-        # Performance logging
-        plan_end_time = time.time()
-        total_time = plan_end_time - plan_start_time
-        
-        if self.enable_debug_output:
-            parallel_mode = "Parallel GPU" if self.enable_gpu_parallel and batch_size > 1 else "Sequential"
-            total_operations = self.mcts_simulations * batch_size
-            ops_per_second = total_operations / total_time if total_time > 0 else 0
-            time_per_sim = total_time / self.mcts_simulations if self.mcts_simulations > 0 else 0
-            
-            print(f"🔧 MCTS Performance Summary:")
-            print(f"  Mode: {parallel_mode}")
-            print(f"  Total Time: {total_time:.2f}s")
-            print(f"  Simulations: {self.mcts_simulations}, Trajectories: {batch_size}")
-            print(f"  Total Operations: {total_operations}")
-            print(f"  Throughput: {ops_per_second:.1f} ops/sec")
-            print(f"  Time per Simulation: {time_per_sim:.3f}s")
-            if self.enable_gpu_parallel and batch_size > 1:
-                theoretical_speedup = batch_size
-                actual_speedup = ops_per_second / batch_size if batch_size > 0 else 0
-                efficiency = (actual_speedup / theoretical_speedup * 100) if theoretical_speedup > 0 else 0
-                memory_mode = "Memory-Efficient" if self.gpu_memory_efficient else "Standard"
-                print(f"  Parallel Efficiency: {efficiency:.1f}% (vs theoretical {theoretical_speedup}x speedup)")
-                print(f"  Memory Mode: {memory_mode}")
-                
-                # GPU memory usage and efficiency metrics
-                if hasattr(torch.cuda, 'memory_allocated') and torch.cuda.is_available():
-                    gpu_memory_mb = torch.cuda.memory_allocated() / 1024 / 1024
-                    gpu_memory_max_mb = torch.cuda.max_memory_allocated() / 1024 / 1024
-                    gpu_memory_reserved_mb = torch.cuda.memory_reserved() / 1024 / 1024
-                    gpu_name = torch.cuda.get_device_name(0)
-                    print(f"  GPU Device: {gpu_name}")
-                    print(f"  GPU Memory: {gpu_memory_mb:.1f}MB current, {gpu_memory_max_mb:.1f}MB peak, {gpu_memory_reserved_mb:.1f}MB reserved")
-                    
-                    # Memory efficiency
-                    if gpu_memory_max_mb > 0:
-                        memory_efficiency = (gpu_memory_mb / gpu_memory_max_mb) * 100
-                        print(f"  Memory Efficiency: {memory_efficiency:.1f}%")
-                    
-                    # Estimate GPU utilization based on batch processing
-                    if batch_size >= 8:
-                        print(f"  GPU Utilization: High (Batch Size: {batch_size})")
-                    elif batch_size >= 4:
-                        print(f"  GPU Utilization: Medium (Batch Size: {batch_size})")
-                    else:
-                        print(f"  GPU Utilization: Low (Batch Size: {batch_size})")
-                        
-                    # Reset peak memory for next run
-                    torch.cuda.reset_peak_memory_stats()
 
         return plan_hist
     
@@ -706,7 +629,7 @@ class MCTDPlanning(DiffusionForcingBase):
     def _denoise_subplan(self, node: MCTSNode, guidance_scale: float, plan: torch.Tensor, 
                         conditions, scheduling_matrix: np.ndarray, start_step: int, 
                         pad_tokens: int, batch_size: int, guidance_fn, mcts_subplan_size: int,
-                        total_diffusion_steps: int, traj_idx: int) -> torch.Tensor:
+                        total_diffusion_steps: int) -> torch.Tensor:
         """DENOISESUBPLAN: Generate new subplan using diffusion following Algorithm 7"""
         # Algorithm 7 Line 4: procedure DENOISESUBPLAN(node, gs)
         temp_plan = plan.clone()
@@ -729,7 +652,7 @@ class MCTDPlanning(DiffusionForcingBase):
 
     def _expand(self, node: MCTSNode, plan: torch.Tensor, conditions, scheduling_matrix: np.ndarray,
                 step: int, pad_tokens: int, batch_size: int, guidance_fn, mcts_subplan_size: int,
-                total_diffusion_steps: int, traj_idx: int) -> Optional[MCTSNode]:
+                total_diffusion_steps: int) -> Optional[MCTSNode]:
         """Expansion phase following Algorithm 4 from MCTD paper"""
         # Step 2: gs ← SELECTMETAACTION(node) {Determine guidance level}
         guidance_scale = self._select_meta_action(node)
@@ -741,7 +664,7 @@ class MCTDPlanning(DiffusionForcingBase):
         # Step 3: child ← DENOISESUBPLAN(node, gs) {Generate new subplan using diffusion}
         child_state = self._denoise_subplan(node, guidance_scale, plan, conditions, 
                                           scheduling_matrix, step, pad_tokens, batch_size, guidance_fn, mcts_subplan_size,
-                                          total_diffusion_steps, traj_idx)
+                                          total_diffusion_steps)
         
         # Step 4: ADDCHILD(node, child)
         child = node.add_child(child_state, guidance_scale)
@@ -849,15 +772,6 @@ class MCTDPlanning(DiffusionForcingBase):
         # Return first_reach.mean() equivalent as used in interact()
         return first_reach.mean().item()
     
-    def _create_gpu_tensor(self, data, dtype=None):
-        """Helper method to ensure tensors are created on GPU"""
-        if isinstance(data, torch.Tensor):
-            return data.to(self.device)
-        else:
-            if dtype is None:
-                dtype = torch.float32
-            return torch.tensor(data, device=self.device, dtype=dtype)
-    
     def _calculate_position_only_guidance(self, current_plan: torch.Tensor, t: int, guidance_scale: float, goal: torch.Tensor) -> torch.Tensor:
         """
         Calculate guidance considering only position distance (dist_o), ignoring action distance (dist_a)
@@ -877,7 +791,7 @@ class MCTDPlanning(DiffusionForcingBase):
 
         return position_dist
 
-    def _evaluate_plan(self, full_plan: torch.Tensor, guidance_fn, node: MCTSNode, goal: torch.Tensor, traj_idx: int) -> float:
+    def _evaluate_plan(self, full_plan: torch.Tensor, guidance_fn, node: MCTSNode, goal: torch.Tensor) -> float:
         """
         EVALUATEPLAN: Evaluate the quality of a complete plan following Algorithm 5 and A.5.6 MCTD REWARD FUNCTION
         
@@ -901,7 +815,7 @@ class MCTDPlanning(DiffusionForcingBase):
             
             # Format path as requested: (depth, meta action) -> (depth, meta action)
             path_str = " -> ".join([f"({depth}, {action})" for depth, action in path])
-            print(f"  Trajectory {traj_idx} Path: {path_str}")
+            print(f"Path: {path_str}")
         
         # Convert full_plan to trajectory format for evaluation
         plan_traj = rearrange(full_plan, "t b (fs c) -> (t fs) b c", fs=self.frame_stack)
@@ -933,6 +847,11 @@ class MCTDPlanning(DiffusionForcingBase):
             # Penalty for unrealistic jumps
             large_jumps = pos_distances > max_step_distance
             position_penalty = -large_jumps.float().sum().item() * 2.0  # Heavy penalty
+            
+            # Debug output: Position distances and penalty
+            # if self.enable_debug_output:
+                # print(f"Pos Distances: {pos_distances}")
+                # print(f"Position Penalty: {position_penalty}")
         
         # Rule 2: Reward for reaching the goal using first_reach metric borrowed from interact()
         goal_reward = 0.0
@@ -953,8 +872,8 @@ class MCTDPlanning(DiffusionForcingBase):
                 goal_reward = 0.0
 
         if self.enable_debug_output:
-            print(f"  Trajectory {traj_idx} - Position Penalty: {position_penalty}")  
-            print(f"  Trajectory {traj_idx} - Goal Reward: {goal_reward}")
+            print(f"Position Penalty: {position_penalty}")  
+            print(f"Goal Reward: {goal_reward}")
         # Combine all reward components
         total_reward = position_penalty + goal_reward
         
@@ -964,7 +883,7 @@ class MCTDPlanning(DiffusionForcingBase):
     def _simulate(self, node: MCTSNode, plan: torch.Tensor, conditions, 
                  scheduling_matrix: np.ndarray, pad_tokens: int, batch_size: int, 
                  guidance_fn, mcts_subplan_size: int, total_diffusion_steps: int, 
-                 start: torch.Tensor, goal: torch.Tensor, traj_idx: int) -> float:
+                 start: torch.Tensor, goal: torch.Tensor) -> float:
         """Simulation phase following Algorithm 5 from MCTD paper (Jumpy Denoising)"""
         # Step 2: fullPlan ← FASTJUMPYDENOISING(node)
         full_plan = self._fast_jumpy_denoising(node, plan, conditions, scheduling_matrix, 
@@ -972,7 +891,7 @@ class MCTDPlanning(DiffusionForcingBase):
                                              total_diffusion_steps, traj_idx)
         
         # Step 3: return EVALUATEPLAN(fullPlan)
-        return self._evaluate_plan(full_plan, guidance_fn, node, goal, traj_idx)
+        return self._evaluate_plan(full_plan, guidance_fn, node, goal)
     
     def _backpropagate(self, node: Optional[MCTSNode], reward: float):
         """Backpropagation phase following Algorithm 6 from MCTD paper"""

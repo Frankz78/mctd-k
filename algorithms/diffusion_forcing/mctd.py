@@ -67,6 +67,16 @@ class MCTDPlanning(DiffusionForcingBase):
         # Guidance scale options (each MCTS edge represents a subplan selection)
         self.guidance_scales = getattr(cfg, 'guidance_scales', [0, 0.1, 0.5, 1, 2])  # List of guidance scales to use
         
+        # Debug and logging switches
+        # Usage examples in config:
+        # enable_tqdm: false                    # Disable progress bar
+        # enable_debug_output: false            # Disable debug print statements
+        self.enable_tqdm = getattr(cfg, 'enable_tqdm', True)  # Enable/disable tqdm progress bar
+        self.enable_debug_output = getattr(cfg, 'enable_debug_output', True)  # Enable/disable debug print statements
+        
+        # MCTS context flag for proper guidance function handling
+        self._in_mcts_context = False
+        
         super().__init__(cfg)
         self.plot_end_points = cfg.plot_start_goal and self.guidance_scale != 0
 
@@ -194,75 +204,57 @@ class MCTDPlanning(DiffusionForcingBase):
         """
         # Print caller information
         import inspect
-        try:
-            current_frame = inspect.currentframe()
-            if current_frame is not None:
-                caller_frame = current_frame.f_back
-                if caller_frame is not None:
-                    caller_name = caller_frame.f_code.co_name
-                    caller_line = caller_frame.f_lineno
-                    
-                    # Get more context about the caller
-                    if caller_name == 'eval_planning':
-                        caller_context = "eval_planning (Planning Evaluation)"
-                    elif caller_name == 'interact':
-                        caller_context = "interact (Environment Interaction)"
-                    elif caller_name in ['validation_step', 'test_step']:
-                        caller_context = f"{caller_name} (Validation/Test Step)"
-                    elif caller_name == 'training_step':
-                        caller_context = f"{caller_name} (Training Step)"
+        if self.enable_debug_output:
+            try:
+                current_frame = inspect.currentframe()
+                if current_frame is not None:
+                    caller_frame = current_frame.f_back
+                    if caller_frame is not None:
+                        caller_name = caller_frame.f_code.co_name
+                        caller_line = caller_frame.f_lineno
+                        
+                        # Get more context about the caller
+                        if caller_name == 'eval_planning':
+                            caller_context = "eval_planning (Planning Evaluation)"
+                        elif caller_name == 'interact':
+                            caller_context = "interact (Environment Interaction)"
+                        elif caller_name in ['validation_step', 'test_step']:
+                            caller_context = f"{caller_name} (Validation/Test Step)"
+                        elif caller_name == 'training_step':
+                            caller_context = f"{caller_name} (Training Step)"
+                        else:
+                            caller_context = f"{caller_name} (Other Call)"
+                        
+                        print(f"🔍 MCTS Plan Called - Caller: {caller_context}, Line: {caller_line}, Batch Size: {start.shape[0]}, Horizon: {horizon}")
                     else:
-                        caller_context = f"{caller_name} (Other Call)"
-                    
-                    print(f"🔍 MCTS Plan Called - Caller: {caller_context}, Line: {caller_line}, Batch Size: {start.shape[0]}, Horizon: {horizon}")
+                        print(f"🔍 MCTS Plan Called - Caller: Unknown (Cannot get call stack), Batch Size: {start.shape[0]}, Horizon: {horizon}")
                 else:
-                    print(f"🔍 MCTS Plan Called - Caller: Unknown (Cannot get call stack), Batch Size: {start.shape[0]}, Horizon: {horizon}")
-            else:
-                print(f"🔍 MCTS Plan Called - Caller: Unknown (Frame is None), Batch Size: {start.shape[0]}, Horizon: {horizon}")
-        except Exception:
-            print(f"🔍 MCTS Plan Called - Caller: Unknown (Check failed), Batch Size: {start.shape[0]}, Horizon: {horizon}")
+                    print(f"🔍 MCTS Plan Called - Caller: Unknown (Frame is None), Batch Size: {start.shape[0]}, Horizon: {horizon}")
+            except Exception:
+                print(f"🔍 MCTS Plan Called - Caller: Unknown (Check failed), Batch Size: {start.shape[0]}, Horizon: {horizon}")
         
         batch_size = start.shape[0]
+        
+        # Set MCTS context flag for proper guidance function creation
+        self._in_mcts_context = True
 
         start = self.make_bundle(start)
         goal = self.make_bundle(goal)
 
         def goal_guidance(x):
-            # x is a tensor of shape [t b (fs c)]
-            pred = rearrange(x, "t b (fs c) -> (t fs) b c", fs=self.frame_stack)
-            h_padded = pred.shape[0] - self.frame_stack  # include padding when horizon % frame_stack != 0
+            """Goal guidance function that applies global guidance_scale for non-MCTS usage"""
+            base_guidance = self._base_goal_guidance(x, start, goal, horizon)
+            return self.guidance_scale * base_guidance
 
-            if not self.use_reward:
-                # sparse / no reward setting, guide with goal like diffuser
-                target = torch.stack([start] * self.frame_stack + [goal] * (h_padded))
-                dist = nn.functional.mse_loss(pred, target, reduction="none")  # (t fs) b c
-
-                # guidance weight for observation and action
-                weight = np.array(
-                    [20] * (self.frame_stack)  # conditoning (aka reconstruction guidance)
-                    + [1 for _ in range(horizon)]  # try to reach the goal at any horizon
-                    + [0] * (h_padded - horizon)  # don't guide padded entries due to horizon % frame_stack != 0
-                )
-                weight = torch.from_numpy(weight).float().to(self.device)
-                
-                dist_o, dist_a, _ = self.split_bundle(dist)  # guidance observation and action with separate weights
-                dist_a = torch.sum(dist_a, -1, keepdim=True).sqrt()
-                dist_o = reduce(dist_o, "t b (n c) -> t b n", "sum", n=self.observation_dim // 2).sqrt()
-                dist_o = torch.tanh(dist_o / 2)  # similar to the "squashed gaussian" in RL, squash to (-1, 1)
-                dist = torch.cat([dist_o, dist_a], -1)
-                weight = repeat(weight, "t -> t c", c=dist.shape[-1])
-                weight[self.frame_stack :, 1:] = 8
-                weight[: self.frame_stack, 1:] = 2
-                weight = torch.ones_like(dist) * weight[:, None]
-
-                episode_return = -(dist * weight).mean() * 1000
-            else:
-                # dense reward seeting, guide with reward
-                raise NotImplementedError("reward guidance not officially supported yet, although implemented")
-
-            return self.guidance_scale * episode_return
-
-        guidance_fn = goal_guidance if self.guidance_scale else None
+        # For MCTS: always create base guidance function, scale will be applied by _create_guidance_function
+        # For non-MCTS: use scaled guidance function based on global guidance_scale
+        if hasattr(self, '_in_mcts_context') and self._in_mcts_context:
+            # MCTS context: provide unscaled base guidance function
+            base_guidance_fn = lambda x: self._base_goal_guidance(x, start, goal, horizon)
+            guidance_fn = base_guidance_fn
+        else:
+            # Non-MCTS context: use global guidance_scale
+            guidance_fn = goal_guidance if self.guidance_scale else None
 
         plan_tokens = np.ceil(horizon / self.frame_stack).astype(int)
         pad_tokens = 0 if self.causal else self.n_tokens - plan_tokens - 1
@@ -300,15 +292,19 @@ class MCTDPlanning(DiffusionForcingBase):
         
         # Add progress bar to display MCTS execution progress and runtime
         tqdm_progress = None
-        try:
-            from tqdm import tqdm
-            tqdm_progress = tqdm(range(self.mcts_simulations), 
-                                desc=f"MCTS Tree Search (Budget: {self.mcts_simulations} steps)", 
-                                ncols=120,
-                                bar_format='{desc}: {percentage:3.0f}%|{bar}| {n_fmt}/{total_fmt} [ {elapsed}, {remaining},  {rate_fmt}]')
-            mcts_iterator = tqdm_progress
-        except ImportError:
-            # If tqdm is not available, use plain range
+        if self.enable_tqdm:
+            try:
+                from tqdm import tqdm
+                tqdm_progress = tqdm(range(self.mcts_simulations), 
+                                    desc=f"MCTS Tree Search (Budget: {self.mcts_simulations} steps)", 
+                                    ncols=120,
+                                    bar_format='{desc}: {percentage:3.0f}%|{bar}| {n_fmt}/{total_fmt} [ {elapsed}, {remaining},  {rate_fmt}]')
+                mcts_iterator = tqdm_progress
+            except ImportError:
+                # If tqdm is not available, use plain range
+                mcts_iterator = range(self.mcts_simulations)
+        else:
+            # Tqdm disabled, use plain range
             mcts_iterator = range(self.mcts_simulations)
         
         for simulation_idx in mcts_iterator:
@@ -327,14 +323,17 @@ class MCTDPlanning(DiffusionForcingBase):
                     # Calculate diffusion step corresponding to current depth
                     diffusion_step = min(current_depth * mcts_subplan_size, total_diffusion_steps - 1)
                     expanded_child = self._expand(leaf_node, plan, conditions, scheduling_matrix, 
-                                                diffusion_step, pad_tokens, batch_size, guidance_fn)
+                                                diffusion_step, pad_tokens, batch_size, guidance_fn, mcts_subplan_size,
+                                                total_diffusion_steps)
                 
                 # 3. Select simulation node
                 simulation_node = expanded_child if expanded_child is not None else leaf_node
             
             # 4. Simulation: Evaluate the value of selected node
+            # Pass original start and goal to _simulate
             value = self._simulate(simulation_node, plan, conditions, scheduling_matrix, 
-                                 pad_tokens, batch_size, guidance_fn, mcts_subplan_size, total_diffusion_steps)
+                                 pad_tokens, batch_size, guidance_fn, mcts_subplan_size, total_diffusion_steps,
+                                 start, goal)
             
             # 5. Backpropagation: Backpropagate value to root node
             self._backpropagate(simulation_node, value)
@@ -373,8 +372,50 @@ class MCTDPlanning(DiffusionForcingBase):
         plan_hist = rearrange(plan_hist, "m t b (fs c) -> m (t fs) b c", fs=self.frame_stack)
         plan_hist = plan_hist[:, self.frame_stack : self.frame_stack + horizon]
 
+        # Clear MCTS context flag
+        self._in_mcts_context = False
+
         return plan_hist
     
+    def _base_goal_guidance(self, x: torch.Tensor, start: torch.Tensor, goal: torch.Tensor, horizon: int) -> torch.Tensor:
+        """
+        Base goal guidance function without any scaling applied
+        Returns raw guidance value that can be scaled by different guidance_scale values
+        """
+        # x is a tensor of shape [t b (fs c)]
+        pred = rearrange(x, "t b (fs c) -> (t fs) b c", fs=self.frame_stack)
+        h_padded = pred.shape[0] - self.frame_stack  # include padding when horizon % frame_stack != 0
+
+        if not self.use_reward:
+            # sparse / no reward setting, guide with goal like diffuser
+            target = torch.stack([start] * self.frame_stack + [goal] * (h_padded))
+            dist = nn.functional.mse_loss(pred, target, reduction="none")  # (t fs) b c
+
+            # guidance weight for observation and action
+            weight = np.array(
+                [20] * (self.frame_stack)  # conditoning (aka reconstruction guidance)
+                + [1 for _ in range(horizon)]  # try to reach the goal at any horizon
+                + [0] * (h_padded - horizon)  # don't guide padded entries due to horizon % frame_stack != 0
+            )
+            weight = torch.from_numpy(weight).float().to(self.device)
+            
+            dist_o, dist_a, _ = self.split_bundle(dist)  # guidance observation and action with separate weights
+            dist_a = torch.sum(dist_a, -1, keepdim=True).sqrt()
+            dist_o = reduce(dist_o, "t b (n c) -> t b n", "sum", n=self.observation_dim // 2).sqrt()
+            dist_o = torch.tanh(dist_o / 2)  # similar to the "squashed gaussian" in RL, squash to (-1, 1)
+            dist = torch.cat([dist_o, dist_a], -1)
+            weight = repeat(weight, "t -> t c", c=dist.shape[-1])
+            weight[self.frame_stack :, 1:] = 8
+            weight[: self.frame_stack, 1:] = 2
+            weight = torch.ones_like(dist) * weight[:, None]
+
+            episode_return = -(dist * weight).mean() * 1000
+        else:
+            # dense reward seeting, guide with reward
+            raise NotImplementedError("reward guidance not officially supported yet, although implemented")
+
+        return episode_return
+
     def _select(self, root: MCTSNode) -> MCTSNode:
         """Selection phase: traverse tree using UCB1 following Algorithm 3 from MCTD paper"""
         node = root
@@ -400,7 +441,8 @@ class MCTDPlanning(DiffusionForcingBase):
         
         # Single action case
         if len(available_actions) == 1:
-            return available_actions[0]
+            selected_action = available_actions[0]
+            return selected_action
         
         # UCB Selection for multiple available actions
         total_visits = sum(child.visits for child in node.children) + 1  # +1 to avoid log(0)
@@ -421,11 +463,9 @@ class MCTDPlanning(DiffusionForcingBase):
             return dummy_guidance
         else:  # gs ≠ NO: Guided sampling with scaled guidance
             def scaled_guidance(x):
-                # base_guidance_fn already includes self.guidance_scale, so we need to normalize first
+                # base_guidance_fn now returns unscaled guidance, so we can directly apply the scale
                 base_result = base_guidance_fn(x)
-                # Remove the original scaling and apply the new one
-                normalized_result = base_result / max(self.guidance_scale, 1e-8)
-                return guidance_scale * normalized_result
+                return guidance_scale * base_result
             return scaled_guidance
 
     def _calculate_ucb_score(self, action_or_child, node: MCTSNode, total_visits: int) -> float:
@@ -474,8 +514,9 @@ class MCTDPlanning(DiffusionForcingBase):
             return exploitation + exploration
 
     def _denoise_subplan(self, node: MCTSNode, guidance_scale: float, plan: torch.Tensor, 
-                        conditions, scheduling_matrix: np.ndarray, step: int, 
-                        pad_tokens: int, batch_size: int, guidance_fn) -> torch.Tensor:
+                        conditions, scheduling_matrix: np.ndarray, start_step: int, 
+                        pad_tokens: int, batch_size: int, guidance_fn, mcts_subplan_size: int,
+                        total_diffusion_steps: int) -> torch.Tensor:
         """DENOISESUBPLAN: Generate new subplan using diffusion following Algorithm 7"""
         # Algorithm 7 Line 4: procedure DENOISESUBPLAN(node, gs)
         temp_plan = plan.clone()
@@ -484,15 +525,20 @@ class MCTDPlanning(DiffusionForcingBase):
         # Algorithm 7 Line 5-9: Create appropriate guidance function
         temp_guidance_fn = self._create_guidance_function(guidance_scale, guidance_fn)
         
-        # Apply diffusion step with appropriate guidance
-        temp_plan = self._apply_diffusion_step(temp_plan, conditions, scheduling_matrix, 
-                                             step, pad_tokens, batch_size, temp_guidance_fn)
+        # Apply multiple diffusion steps according to mcts_subplan_size
+        # This represents a complete "subplan" denoising process
+        for step_offset in range(mcts_subplan_size):
+            current_step = start_step + step_offset
+            if current_step < total_diffusion_steps:
+                temp_plan = self._apply_diffusion_step(temp_plan, conditions, scheduling_matrix, 
+                                                     current_step, pad_tokens, batch_size, temp_guidance_fn)
         
         # Return the new subplan state
         return temp_plan[1 : self.n_tokens - pad_tokens]
 
     def _expand(self, node: MCTSNode, plan: torch.Tensor, conditions, scheduling_matrix: np.ndarray,
-                step: int, pad_tokens: int, batch_size: int, guidance_fn) -> Optional[MCTSNode]:
+                step: int, pad_tokens: int, batch_size: int, guidance_fn, mcts_subplan_size: int,
+                total_diffusion_steps: int) -> Optional[MCTSNode]:
         """Expansion phase following Algorithm 4 from MCTD paper"""
         # Step 2: gs ← SELECTMETAACTION(node) {Determine guidance level}
         guidance_scale = self._select_meta_action(node)
@@ -503,7 +549,8 @@ class MCTDPlanning(DiffusionForcingBase):
         
         # Step 3: child ← DENOISESUBPLAN(node, gs) {Generate new subplan using diffusion}
         child_state = self._denoise_subplan(node, guidance_scale, plan, conditions, 
-                                          scheduling_matrix, step, pad_tokens, batch_size, guidance_fn)
+                                          scheduling_matrix, step, pad_tokens, batch_size, guidance_fn, mcts_subplan_size,
+                                          total_diffusion_steps)
         
         # Step 4: ADDCHILD(node, child)
         child = node.add_child(child_state, guidance_scale)
@@ -528,15 +575,108 @@ class MCTDPlanning(DiffusionForcingBase):
         current_depth = self._get_node_depth(node)
         start_step = min(current_depth * mcts_subplan_size, total_diffusion_steps - 1)
         
+        # Create guidance function consistent with this node's meta action
+        node_guidance_scale = node.action if node.action is not None else 0.0
+        consistent_guidance_fn = self._create_guidance_function(node_guidance_scale, guidance_fn)
+        
         # Apply remaining diffusion steps from the node's corresponding step onwards
         # This maintains MCTS tree semantics where each node represents a partial denoising state
+        # Use guidance scale consistent with the node's meta action throughout
         for step in range(start_step, total_diffusion_steps):
             temp_plan = self._apply_diffusion_step(temp_plan, conditions, scheduling_matrix, 
-                                                 step, pad_tokens, batch_size, guidance_fn)
+                                                 step, pad_tokens, batch_size, consistent_guidance_fn)
         
         return temp_plan
     
-    def _evaluate_plan(self, full_plan: torch.Tensor, guidance_fn) -> float:
+    def _simulate_interact_for_goal_reward(self, full_plan: torch.Tensor, guidance_fn, horizon: int, node_guidance_scale: Optional[float], goal: torch.Tensor) -> float:
+        """
+        Simplified simulation of interact() logic for goal reward calculation
+        Based on interact() method but without environment interaction
+        Returns first_reach.mean() equivalent
+        
+        Note: Only uses position distance (dist_o) for goal reaching, ignores action distance (dist_a)
+        since goal reaching is determined by position, not action quality
+        """
+        # Convert full_plan to trajectory format
+        plan_traj = rearrange(full_plan, "t b (fs c) -> (t fs) b c", fs=self.frame_stack)
+        plan_traj = plan_traj[self.frame_stack:]  # Remove initial padding
+        
+        # Extract batch size and limit horizon
+        batch_size = plan_traj.shape[1]
+        actual_horizon = min(horizon, plan_traj.shape[0])
+        
+        # Use node-specific guidance scale if provided, otherwise fallback to global guidance scale
+        effective_guidance_scale = node_guidance_scale if node_guidance_scale is not None else self.guidance_scale
+        
+        # Debug output
+        if self.enable_debug_output:
+            print(f"🔍 Goal Reward Debug - Guidance FN: {guidance_fn is not None}, Batch Size: {batch_size}, Actual Horizon: {actual_horizon}")
+            if guidance_fn is not None:
+                print(f"  Node guidance_scale: {effective_guidance_scale} (MCTS node: {node_guidance_scale}, Global: {self.guidance_scale})")
+            else:
+                print(f"  No guidance function - guidance_scale: {effective_guidance_scale}")
+        
+        # Initialize tracking variables like in interact()
+        reached = torch.zeros(batch_size, dtype=torch.bool, device=full_plan.device)
+        first_reach = torch.zeros(batch_size, device=full_plan.device)
+        
+        # Extract goal position from the guidance function context
+        # We need to reconstruct start and goal from the plan context
+        # Since we don't have direct access to start/goal here, we'll use a different approach
+        
+        # Simulate step-by-step trajectory execution like interact()
+        for t in range(actual_horizon):
+            # Extract current position from the trajectory
+            current_obs, _, _ = self.split_bundle(plan_traj[t])  # Shape: (b, obs_dim)
+            current_position = current_obs[:, :2]  # Assume first 2 dims are x, y coordinates
+
+            # Calculate position-only guidance directly using current_position
+            position_dist = torch.norm(current_position - goal, dim=-1)  # (b,) - Euclidean distance for time step `t`
+
+            # Debug output for key values (first, middle, last steps)
+            if self.enable_debug_output:
+                mid_step = actual_horizon // 2
+                last_step = actual_horizon - 1
+                if t == 0 or t == mid_step or t == last_step:
+                    step_type = "First" if t == 0 else ("Middle" if t == mid_step else "Last")
+                    print(f"  Step {t} ({step_type}): Position-only: {position_dist.mean().item():.6f}, Position-only min: {position_dist.min().item():.6f}")
+
+            # Use position-only guidance for goal reaching decision
+            simulated_reward = torch.exp(-position_dist)
+
+            newly_reached = (simulated_reward >= 0.7) & (~reached)  # Corresponds to distance <= 0.45
+
+            reached = reached | newly_reached
+            # Update first_reach counter (increment for non-reached samples)
+            first_reach += (~reached).float()
+        
+        # Final debug output
+        if self.enable_debug_output:
+            print(f"🔍 Final Results - Reached any: {reached.any().item()}, First reach mean: {first_reach.mean().item():.2f}")
+        
+        # Return first_reach.mean() equivalent as used in interact()
+        return first_reach.mean().item()
+    
+    def _calculate_position_only_guidance(self, current_plan: torch.Tensor, t: int, guidance_scale: float, goal: torch.Tensor) -> torch.Tensor:
+        """
+        Calculate guidance considering only position distance (dist_o), ignoring action distance (dist_a)
+        This is more appropriate for goal reaching evaluation since we only care about position
+        Modified to match maze2d dense reward: exp(-distance)
+        """
+        # Extract the current trajectory state
+        pred = rearrange(current_plan, "t b (fs c) -> (t fs) b c", fs=self.frame_stack)
+
+        # Extract only observations (positions) from pred
+        pred_obs, _, _ = self.split_bundle(pred)
+
+        # Calculate only position distance (first 2 dimensions typically x, y)
+        position_pred = pred_obs[:, :, :2]  # x, y coordinates
+
+        position_dist = torch.norm(position_pred[t] - goal, dim=-1)  # (b,) - Euclidean distance for time step `t`
+
+        return position_dist
+
+    def _evaluate_plan(self, full_plan: torch.Tensor, guidance_fn, node: MCTSNode, goal: torch.Tensor) -> float:
         """
         EVALUATEPLAN: Evaluate the quality of a complete plan following Algorithm 5 and A.5.6 MCTD REWARD FUNCTION
         
@@ -544,6 +684,24 @@ class MCTDPlanning(DiffusionForcingBase):
         1. Check for physically impossible large position differences between near states
         2. Give reward when reaching goal with formula: r = (H - t)/H for early reaching
         """
+        # Debug output: Trace path from root to current node
+        if self.enable_debug_output:
+            path = []
+            current = node
+            # Trace back to root
+            while current is not None:
+                depth = self._get_node_depth(current)
+                action = current.action if current.action is not None else "ROOT"
+                path.append((depth, action))
+                current = current.parent
+            
+            # Reverse to show root -> ... -> current
+            path.reverse()
+            
+            # Format path as requested: (depth, meta action) -> (depth, meta action)
+            path_str = " -> ".join([f"({depth}, {action})" for depth, action in path])
+            print(f"Path: {path_str}")
+        
         # Convert full_plan to trajectory format for evaluation
         plan_traj = rearrange(full_plan, "t b (fs c) -> (t fs) b c", fs=self.frame_stack)
         plan_traj = plan_traj[self.frame_stack:]  # Remove initial padding
@@ -566,77 +724,48 @@ class MCTDPlanning(DiffusionForcingBase):
             pos_distances = torch.norm(pos_diffs, dim=2)  # Shape: (T-1, B)
             
             # Define maximum physically reasonable distance per step
-            max_step_distance = 0.08  # Adjust based on environment specifics
+            max_step_distance = 0.1  # Adjust based on environment specifics
             
             # Penalty for unrealistic jumps
             large_jumps = pos_distances > max_step_distance
             position_penalty = -large_jumps.float().sum().item() * 2.0  # Heavy penalty
-            print(f"Pos distances: {pos_distances}")
-            print(f"Position penalty: {position_penalty}")
+            
+            # Debug output: Position distances and penalty
+            # if self.enable_debug_output:
+                # print(f"Pos Distances: {pos_distances}")
+                # print(f"Position Penalty: {position_penalty}")
         
-        # Rule 2: Reward for reaching the goal using first_reach metric borrowed from validation_step
+        # Rule 2: Reward for reaching the goal using first_reach metric borrowed from interact()
         goal_reward = 0.0
         if horizon > 0:
-            # Simulate trajectory execution similar to interact() method but without environment
-            # Extract trajectory positions for goal distance calculation
-            batch_size = observations.shape[1]
-            
-            # Initialize tracking variables like in interact()
-            reached = torch.zeros(batch_size, dtype=torch.bool, device=observations.device)
-            first_reach = torch.zeros(batch_size, device=observations.device)
-            
-            # Goal distance threshold for considering "reached" (reward >= 1.0 in interact())
-            goal_distance_threshold = 0.1  # Adjust based on environment
-            
-            # Simulate step-by-step trajectory execution
-            for t in range(horizon):
-                current_pos = observations[t, :, :2]  # Current position (x, y)
-                
-                # Calculate distance to goal (assuming goal is at origin or specific target)
-                # This is a simplified version - in practice, you'd need the actual goal position
-                # For now, use a heuristic based on guidance function
-                if guidance_fn:
-                    # Create a plan up to current timestep to evaluate goal distance
-                    current_plan = full_plan.clone()
-                    # Zero out future timesteps to evaluate current state
-                    plan_traj = rearrange(current_plan, "seq b (fs c) -> (seq fs) b c", fs=self.frame_stack)
-                    if t + self.frame_stack < plan_traj.shape[0]:
-                        plan_traj[t + self.frame_stack + 1:] = 0
-                    current_plan = rearrange(plan_traj, "(seq fs) b c -> seq b (fs c)", fs=self.frame_stack)
-                    
-                    # Use guidance to estimate "reward" at current timestep
-                    step_guidance = guidance_fn(current_plan).mean(dim=0)  # Per batch item
-                    simulated_reward = torch.tanh(step_guidance / 100.0)  # Normalize to ~[0,1] range
-                    
-                    # Check if goal is reached (similar to reward >= 1.0 condition)
-                    newly_reached = (simulated_reward >= 0.8) & (~reached)
-                    reached = reached | newly_reached
-                else:
-                    # Fallback when no guidance function: assume no goal reached
-                    newly_reached = torch.zeros(batch_size, dtype=torch.bool, device=observations.device)
-                
-                # Update first_reach counter (increment for non-reached samples)
-                first_reach += (~reached).float()
+            # Use simplified interact() logic for goal reward calculation
+            # Pass the node's guidance scale to ensure proper evaluation
+            node_guidance_scale = node.action if node.action is not None else 0.0
+            first_reach_mean = self._simulate_interact_for_goal_reward(full_plan, guidance_fn, horizon, node_guidance_scale, goal)
             
             # Calculate goal reward using first_reach metric with r = (H - t)/H formula
-            if reached.any():
-                # For samples that reached the goal, calculate early reaching reward
-                avg_first_reach = first_reach[reached].mean().item()
-                t_reach = avg_first_reach  # Average first reach time
+            # first_reach_mean represents the average time to reach goal (or horizon if not reached)
+            if first_reach_mean < horizon:
+                # Goal was reached, calculate early reaching reward
+                t_reach = first_reach_mean  # Average first reach time
                 goal_reward = (horizon - t_reach) / horizon * 100.0  # r = (H - t)/H
             else:
                 # No goal reached, minimal reward
                 goal_reward = 0.0
-        
+
+        if self.enable_debug_output:
+            print(f"Position Penalty: {position_penalty}")  
+            print(f"Goal Reward: {goal_reward}")
         # Combine all reward components
         total_reward = position_penalty + goal_reward
         
         
         return total_reward
-
+    
     def _simulate(self, node: MCTSNode, plan: torch.Tensor, conditions, 
                  scheduling_matrix: np.ndarray, pad_tokens: int, batch_size: int, 
-                 guidance_fn, mcts_subplan_size: int, total_diffusion_steps: int) -> float:
+                 guidance_fn, mcts_subplan_size: int, total_diffusion_steps: int, 
+                 start: torch.Tensor, goal: torch.Tensor) -> float:
         """Simulation phase following Algorithm 5 from MCTD paper (Jumpy Denoising)"""
         # Step 2: fullPlan ← FASTJUMPYDENOISING(node)
         full_plan = self._fast_jumpy_denoising(node, plan, conditions, scheduling_matrix, 
@@ -644,7 +773,7 @@ class MCTDPlanning(DiffusionForcingBase):
                                              total_diffusion_steps)
         
         # Step 3: return EVALUATEPLAN(fullPlan)
-        return self._evaluate_plan(full_plan, guidance_fn)
+        return self._evaluate_plan(full_plan, guidance_fn, node, goal)
     
     def _backpropagate(self, node: Optional[MCTSNode], reward: float):
         """Backpropagation phase following Algorithm 6 from MCTD paper"""

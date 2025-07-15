@@ -4,12 +4,15 @@ services:
     image: mctd-k 
     container_name: mctd-k-container
     working_dir: /workspace/mctd-k
+    network_mode: host
     volumes:
       - ${HOME}/Workspace/mctd-k:/workspace/mctd-k
       - /home/frank/.wandb:/root/.wandb
     stdin_open: true
     tty: true
     shm_size: 8g
+    security_opt:
+      - no-new-privileges
     deploy:
       resources:
         reservations:

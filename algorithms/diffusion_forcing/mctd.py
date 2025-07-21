@@ -107,7 +107,7 @@ class MCTDPlanning(DiffusionForcingBase):
         self.cfg.diffusion.beta_schedule = "linear"  # Beta Schedule: Linear
         self.cfg.diffusion.objective = "pred_x0"  # Diffusion Model Objective: x0-prediction
         self.cfg.diffusion.ddim_sampling_eta = 0.0  # DDIM Sampling eta
-        self.cfg.diffusion.sampling_timesteps = 20  # The number of Partial Denoising
+        self.cfg.diffusion.sampling_timesteps = 50  # The number of Partial Denoising
         
         # Network architecture parameters from Table 6
         self.cfg.diffusion.architecture.network_size = 128  # Network Size

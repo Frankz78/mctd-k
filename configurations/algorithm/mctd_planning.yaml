@@ -53,6 +53,9 @@ mcts_num_actions: 4
 # MCTS guidance scales for tree search (different from global guidance_scale)
 guidance_scales: [0, 0.1, 0.5, 1, 2]  # List of guidance scales to explore in MCTS tree search
 
+use_manual_path: True
+manual_optimal_path: "Path: (0, ROOT) -> (1, 2) -> (2, 2) -> (3, 2) -> (4, 2) -> (5, 2)"
+
 # Diffusion model parameters
 diffusion:
   # Training parameters
@@ -68,7 +71,7 @@ diffusion:
   timesteps: 1000
   
   # Sampling parameters
-  sampling_timesteps: 20  # The number of Partial Denoising
+  sampling_timesteps: 50  # The number of Partial Denoising
   ddim_sampling_eta: 0.0  # DDIM Sampling eta
   stabilization_level: 10  # Stabilization Level
   
